@@ -1,40 +1,69 @@
 import torch
-import matplotlib.pyplot as plt
-from engine import Generator
+import time
+# --- Transformers FP8 Bug Fix Patch ---
+if not hasattr(torch, "float8_e8m0fnu"):
+    setattr(torch, "float8_e8m0fnu", torch.float32)
+# --------------------------------------
 
-# 1. Initialize the untrained Generator
-gen = Generator(latent_dim=100, channels=3)
-# gen.eval() # Set to evaluation mode
+from diffusers import AutoPipelineForText2Image
 
-# 2. Create 16 random noise vectors
-noise = torch.randn(16, 100)
+if torch.cuda.is_available():
+    device = "cuda"
+    dtype = torch.float16
+elif torch.backends.mps.is_available():
+    device = "mps"
+    dtype = torch.float16
+else:
+    device = "cpu"
+    dtype = torch.float32
 
-# 3. Generate the dummy images (turn off gradients for speed)
-with torch.no_grad():
-    fake_images = gen(noise)
+print(f"Booting Engine on: {device.upper()}")
+print("Downloading/Loading SDXL Turbo... (This will take a few minutes the first time)")
 
-# 4. Set up the Matplotlib UI
-fig, axes = plt.subplots(4, 4, figsize=(6, 6))
-fig.suptitle("Untrained DCGAN Output (Colored Static)", fontsize=16, fontweight='bold')
+pipe = AutoPipelineForText2Image.from_pretrained(
+    "stabilityai/sdxl-turbo",
+    torch_dtype=dtype,
+    variant="fp16" if device != "cpu" else None
+)
+pipe = pipe.to(device)
+pipe.set_progress_bar_config(disable=True)
 
-for i, ax in enumerate(axes.flatten()):
-    # Grab a single image tensor from the batch
-    img = fake_images[i]
+generator = torch.Generator(device=device).manual_seed(42)
+fixed_latents = torch.randn(
+    (1,4,64,64),
+    generator=generator,
+    device=device,
+    dtype=dtype
+)
+
+# Let's simulate a progressive, additive thought process:
+prompts = [
+    "masterpiece, thick impasto oil painting, a serene sunny beach with bright white sand and clear blue ocean",
+    "masterpiece, thick impasto oil painting, a serene sunny beach with bright white sand and clear blue ocean, a tall green coconut tree leaning on the left side",
+    "masterpiece, thick impasto oil painting, a serene sunny beach with bright white sand and clear blue ocean, a tall green coconut tree leaning on the left side, a tall wooden watchtower on the right side"
+]
+
+print("\nStarting Progressive Morph Sequence...")
+
+for i, prompt in enumerate(prompts):
+    # Extract the additive part of the prompt for the print statement
+    theme = prompt.split(',')[-1].strip()
+    print(f"Frame {i+1}: Adding [{theme}]...")
     
-    # 🚨 CRITICAL MATH STEP 🚨
-    # Tanh outputs values from -1.0 to 1.0. 
-    # Matplotlib strictly requires RGB colors to be between 0.0 and 1.0.
-    # We mathematically shift the values back to a positive range.
-    img = (img + 1.0) / 2.0
+    start_time = time.time()
     
-    # PyTorch structures images as (Channels, Height, Width) -> [3, 32, 32]
-    # Matplotlib expects (Height, Width, Channels) -> [32, 32, 3]
-    # .permute() rearranges the dimensions to keep Matplotlib happy!
-    img_np = img.permute(1, 2, 0).numpy()
+    image = pipe(
+        prompt=prompt, 
+        num_inference_steps=1, 
+        guidance_scale=0.0,
+        latents=fixed_latents # Still using the exact same canvas!
+    ).images[0]
     
-    # Draw it
-    ax.imshow(img_np)
-    ax.axis('off')
+    end_time = time.time()
+    
+    generation_time_ms = (end_time - start_time) * 1000
+    print(f"  -> Finished in {generation_time_ms:.0f} ms")
+    
+    image.save(f"progressive_frame_{i+1}.png")
 
-plt.tight_layout()
-plt.show()
+print("\nDone! Open progressive_frame_1.png, 2, and 3.")
